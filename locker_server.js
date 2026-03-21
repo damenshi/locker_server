@@ -349,7 +349,7 @@ app.post('/send-command', (req, res) => {
                     commandHistory.delete(requestId);
                     commandIndex.delete(`${data.doorSort}_${direct}`);
                 }
-            }, 12000);
+            }, 9000);
 
             commandHistory.set(requestId, {
                 callback: (resp)=>{
