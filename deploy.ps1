@@ -34,9 +34,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "   拉取成功" -ForegroundColor Green
 
-# 4. 重启服务（如果需要）
-Write-Host "`n🔄 重启服务..." -ForegroundColor Yellow
-ssh ubuntu1@1.116.109.239 "cd ~/workspace/locker && npm start"
+# 4. 重启服务（用pm2）
+Write-Host "`n🔄 重启服务（pm2）..." -ForegroundColor Yellow
+ssh ubuntu1@1.116.109.239 "cd ~/workspace/locker && pm2 restart locker-server"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "   pm2重启失败，尝试直接启动..." -ForegroundColor Yellow
+    ssh ubuntu1@1.116.109.239 "cd ~/workspace/locker && pm2 start locker_server.js --name locker-server"
+}
 Write-Host "   重启成功" -ForegroundColor Green
 
 Write-Host "`n✅ 部署完成！" -ForegroundColor Green

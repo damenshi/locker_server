@@ -106,23 +106,41 @@ function getFormattedTime() {
 // }
 // ---------- 新的云函数转发（带重试机制，可配置） ----------
 async function forwardToCloudFunction(payload) {
-    const { deviceId } = payload || {};
+    const { deviceId, type } = payload || {};
     let lastErr = null;
+    const startTime = Date.now();
 
     for (let attempt = 1; attempt <= CLOUD_RETRY_MAX; attempt++) {
+        const attemptStart = Date.now();
         try {
+            logger.info(`[云函数转发] deviceId=${deviceId}, type=${type}, 第${attempt}次尝试, 超时=${axios.defaults.timeout}ms`);
             const res = await axios.post(CLOUD_FUNCTION_URL, payload, { timeout: axios.defaults.timeout });
-            logger.info(`[云函数消息][deviceId=${deviceId}] ${JSON.stringify(res.data)}`);
+            const elapsed = Date.now() - startTime;
+            logger.info(`[云函数成功] deviceId=${deviceId}, type=${type}, 尝试次数=${attempt}, 总耗时=${elapsed}ms`);
             return res.data;
         } catch (err) {
+            const attemptElapsed = Date.now() - attemptStart;
             lastErr = err;
-            logger.error(`[服务器消息][deviceId=${deviceId}] 第${attempt}次转发云函数失败: ${err.message}`);
+
+            // 区分错误类型
+            if (err.code === 'ECONNABORTED') {
+                logger.error(`[云函数超时] deviceId=${deviceId}, type=${type}, 第${attempt}次, 本次耗时=${attemptElapsed}ms, 错误=请求超时`);
+            } else if (err.response) {
+                logger.error(`[云函数错误] deviceId=${deviceId}, type=${type}, 第${attempt}次, 本次耗时=${attemptElapsed}ms, HTTP状态=${err.response.status}, 错误=${err.message}`);
+            } else {
+                logger.error(`[云函数异常] deviceId=${deviceId}, type=${type}, 第${attempt}次, 本次耗时=${attemptElapsed}ms, 错误=${err.message}`);
+            }
+
             if (attempt < CLOUD_RETRY_MAX) {
-                const delay = CLOUD_RETRY_INTERVAL * attempt; // 简单退避：1s、2s、3s...
+                const delay = CLOUD_RETRY_INTERVAL * attempt;
+                logger.info(`[云函数重试] deviceId=${deviceId}, type=${type}, 等待${delay}ms后第${attempt + 1}次尝试`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
     }
+
+    const totalElapsed = Date.now() - startTime;
+    logger.error(`[云函数失败] deviceId=${deviceId}, type=${type}, 总尝试次数=${CLOUD_RETRY_MAX}, 总耗时=${totalElapsed}ms, 最后错误=${lastErr?.message}`);
     throw new Error(`云函数调用失败[deviceId=${deviceId}]: ${lastErr?.message}`);
 }
 
@@ -164,11 +182,12 @@ function startHeartbeatChecker() {
         deviceConnections.forEach(({ ws, lastHeartbeat }, deviceId) => {
             // === 修改点：只要超时，无论状态如何，强制清理 ===
             if (now - lastHeartbeat > OFFLINE_THRESHOLD) {
-                logger.info(`[心跳检测] 设备 ${deviceId} 心跳超时(上次:${new Date(lastHeartbeat).toLocaleTimeString()})，强制清理`);
-                
+                const lastTime = new Date(lastHeartbeat).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' });
+                logger.warn(`[心跳超时] deviceId=${deviceId}, 上次心跳=${lastTime}, 离线阈值=${OFFLINE_THRESHOLD}ms, 当前在线设备数=${deviceConnections.size}`);
+
                 // 记录离线事件
                 forwardToCloudFunction({ type: 'device_offline', deviceId, timestamp: now })
-                    .catch(err => logger.error(err.message));
+                    .catch(err => logger.error(`[离线通知失败] deviceId=${deviceId}, error=${err.message}`));
 
                 // 尝试关闭 socket (如果还没关)
                 // 即使状态不是 OPEN，调用 close 也没副作用，或者用 terminate() 强制销毁
@@ -221,7 +240,7 @@ wss.on('connection', (ws) => {
                         currentDeviceId = deviceId;
                         deviceConnections.set(deviceId, { ws, lastHeartbeat: Date.now() });
                         ws.send(JSON.stringify({ direct: 'login', code: 200, data: { number: cloudRes.data.number, url: cloudRes.data.url } }));
-                        logger.info(`[服务器消息]设备 ${deviceId} 登录成功`);
+                        logger.info(`[设备上线] deviceId=${deviceId}, 当前在线设备数=${deviceConnections.size}`);
                     } else throw new Error(cloudRes.message || '云函数未返回有效编号或URL');
                 } catch (err) {
                     logger.error(`[服务器消息]设备 ${deviceId} 登录失败: ${err.message}`);
@@ -294,16 +313,32 @@ wss.on('connection', (ws) => {
 
             // ---------------- openDoor/doorStatus ----------------
             if (['openDoor','doorStatus'].includes(direct)) {
-                logger.info(`[openDoor][deviceId=${currentDeviceId}] ${JSON.stringify(msg)}`);
                 const { code } = msg;
                 const { doorSort, status } = msg.data || {};
+
                 const requestId = commandIndex.get(`${doorSort}_${direct}`);
+
                 if (requestId && commandHistory.has(requestId)) {
-                    const { callback } = commandHistory.get(requestId);
+                    const entry = commandHistory.get(requestId);
+                    const elapsed = Date.now() - (entry.startTime || Date.now());
+
+                    logger.info(`[指令响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${requestId}`);
+
+                    // 如果已经超时了，但设备现在才回复
+                    if (entry.timedOut) {
+                        logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
+                        commandHistory.delete(requestId);
+                        commandIndex.delete(`${doorSort}_${direct}`);
+                        return;
+                    }
+
+                    const { callback } = entry;
                     callback({ code, doorSort, status });
                     commandHistory.delete(requestId);
                     commandIndex.delete(`${doorSort}_${direct}`);
-                } else logger.warn(`[未匹配指令] doorSort=${doorSort}, direct=${direct}`);
+                } else {
+                    logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 可能原因=超时已清理或重复响应`);
+                }
                 return;
             }
 
@@ -316,12 +351,15 @@ wss.on('connection', (ws) => {
         }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
         if (currentDeviceId) {
-            logger.info(`设备 ${currentDeviceId} 断开连接`);
+            const reasonStr = reason ? reason.toString() : '未知';
+            logger.info(`[设备下线] deviceId=${currentDeviceId}, 原因=${reasonStr}, 当前在线设备数=${deviceConnections.size}`);
             deviceConnections.delete(currentDeviceId);
             forwardToCloudFunction({ type: 'device_offline', deviceId: currentDeviceId }).catch(err => logger.error(err.message));
-        } else logger.info('未登录设备断开连接');
+        } else {
+            logger.info(`[连接断开] 未登录设备断开, 当前在线设备数=${deviceConnections.size}`);
+        }
     });
 
     ws.on('error', (err) => logger.error(`[WebSocket错误] ${err.message}`));
@@ -330,23 +368,28 @@ wss.on('connection', (ws) => {
 // ---------- HTTP API ----------
 app.post('/send-command', (req, res) => {
     const { deviceId, direct, data } = req.body;
-    if (!deviceId || !direct || !data) return res.status(400).json({ code:500, message:'缺少参数' });
-    if (!deviceConnections.has(deviceId)) return res.status(404).json({ code:500, message:`设备 ${deviceId} 不在线` });
+    if (!deviceId || !direct || !data) {
+        logger.warn(`[参数错误] 缺少参数 deviceId=${deviceId}, direct=${direct}, data=${JSON.stringify(data)}`);
+        return res.status(400).json({ code:500, message:'缺少参数' });
+    }
+    if (!deviceConnections.has(deviceId)) {
+        logger.warn(`[设备离线] deviceId=${deviceId}, 当前在线设备=${Array.from(deviceConnections.keys()).join(',')}`);
+        return res.status(404).json({ code:500, message:`设备 ${deviceId} 不在线` });
+    }
 
-    // 检查是否已有同门指令在处理中（防止重试覆盖）
+    // 检查是否已有同门指令在处理中
     const indexKey = `${data.doorSort}_${direct}`;
     if (commandIndex.has(indexKey)) {
         const existingRequestId = commandIndex.get(indexKey);
         if (commandHistory.has(existingRequestId)) {
-            // 已有等待中的指令，返回处理中状态
-            logger.info(`[指令重复] 设备 ${deviceId} ${indexKey} 已有指令在处理中，requestId=${existingRequestId}`);
+            logger.warn(`[指令重复] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, existingRequestId=${existingRequestId}`);
             return res.status(200).json({
                 code: 202,
                 message: '同门指令处理中，请稍后重试',
                 requestId: existingRequestId
             });
         }
-        // history 已清理但 index 还在，清理 index 继续
+        logger.info(`[指令清理残留] deviceId=${deviceId}, doorSort=${data.doorSort}, 清理残留index`);
         commandIndex.delete(indexKey);
     }
 
@@ -357,14 +400,25 @@ app.post('/send-command', (req, res) => {
 
     try {
         deviceWs.send(JSON.stringify(command));
-        logger.info(`[发送指令] 设备 ${deviceId} ${JSON.stringify(command)}`);
+        logger.info(`[指令发送] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}`);
 
         new Promise((resolve)=>{
             const timer = setTimeout(() => {
                 if (commandHistory.has(requestId)) {
-                    resolve({ code:500, message:'终端响应超时', requestId });
-                    commandHistory.delete(requestId);
-                    commandIndex.delete(`${data.doorSort}_${direct}`);
+                    const entry = commandHistory.get(requestId);
+                    entry.timedOut = true;
+                    logger.warn(`[指令超时] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 等待时间=9000ms`);
+
+                    // 3秒后清理
+                    setTimeout(() => {
+                        if (commandHistory.has(requestId) && commandHistory.get(requestId).timedOut) {
+                            commandHistory.delete(requestId);
+                            commandIndex.delete(`${data.doorSort}_${direct}`);
+                            logger.info(`[指令清理] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 原因=超时后清理`);
+                        }
+                    }, 3000);
+
+                    resolve({ code:500, message:'终端响应超时', requestId, timedOut: true });
                 }
             }, 9000);
 
@@ -375,7 +429,10 @@ app.post('/send-command', (req, res) => {
                 },
                 timer,
                 doorSort: data.doorSort,
-                direct
+                direct,
+                startTime: Date.now(),
+                deviceId,
+                timedOut: false
             });
             commandIndex.set(`${data.doorSort}_${direct}`, requestId);
 
@@ -384,16 +441,16 @@ app.post('/send-command', (req, res) => {
                 if (commandHistory.has(requestId)) {
                     commandHistory.delete(requestId);
                     commandIndex.delete(`${data.doorSort}_${direct}`);
-                    logger.warn(`[指令兜底清理] requestId=${requestId}`);
+                    logger.warn(`[指令兜底清理] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}`);
                 }
             }, COMMAND_CLEANUP_TIME);
         }).then(resp => {
-            // === 【修改开始】 ===
-            // 如果业务 code 不是 200，强制返回 HTTP 404 状态码
-            // 这样云函数的 axios 就会抛出 Error，从而触发 paynotify 的 catch
+            const elapsed = Date.now() - (commandHistory.get(requestId)?.startTime || Date.now());
             if (resp.code !== 200) {
+                logger.warn(`[指令失败] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, code=${resp.code}, message=${resp.message}, elapsed=${elapsed}ms`);
                 return res.status(404).json(resp);
             }
+            logger.info(`[指令成功] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, code=${resp.code}, elapsed=${elapsed}ms`);
             res.json(resp);
             // === 【修改结束】 ===
         });
