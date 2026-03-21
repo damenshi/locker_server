@@ -333,6 +333,23 @@ app.post('/send-command', (req, res) => {
     if (!deviceId || !direct || !data) return res.status(400).json({ code:500, message:'缺少参数' });
     if (!deviceConnections.has(deviceId)) return res.status(404).json({ code:500, message:`设备 ${deviceId} 不在线` });
 
+    // 检查是否已有同门指令在处理中（防止重试覆盖）
+    const indexKey = `${data.doorSort}_${direct}`;
+    if (commandIndex.has(indexKey)) {
+        const existingRequestId = commandIndex.get(indexKey);
+        if (commandHistory.has(existingRequestId)) {
+            // 已有等待中的指令，返回处理中状态
+            logger.info(`[指令重复] 设备 ${deviceId} ${indexKey} 已有指令在处理中，requestId=${existingRequestId}`);
+            return res.status(200).json({
+                code: 202,
+                message: '同门指令处理中，请稍后重试',
+                requestId: existingRequestId
+            });
+        }
+        // history 已清理但 index 还在，清理 index 继续
+        commandIndex.delete(indexKey);
+    }
+
     const requestId = `cmd_${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
     const deviceWs = deviceConnections.get(deviceId).ws;
     const serverTime = getFormattedTime();
