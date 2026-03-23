@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 const CLOUD_FUNCTION_URL = 'https://cloudbase-3gnr17whd71a5b45-1379469522.ap-shanghai.app.tcloudbase.com/server';
 const HEARTBEAT_CHECK_INTERVAL = 60 * 1000; //60s
 const OFFLINE_THRESHOLD = 120 * 1000;   // 120s
-const COMMAND_CLEANUP_TIME = 15 * 1000;     // 指令兜底 15秒
+const COMMAND_TIMEOUT = 8000;            // 指令超时 8秒 (P0优化: 统一超时)
+const COMMAND_CLEANUP_TIME = 10000;       // 指令兜底清理 10秒
 const MEMORY_WARNING_THRESHOLD = 500 * 1024 * 1024; // 500MB
 const CLOUD_RETRY_MAX = 3;       // 云函数调用最大重试次数
 const CLOUD_RETRY_INTERVAL = 1000; // 每次重试的间隔基准 (ms)，会指数退避
@@ -155,9 +156,14 @@ const wss = new WebSocket.Server({ server });
 
 // 设备连接 & 指令记录
 const deviceConnections = new Map(); // deviceId -> { ws, lastHeartbeat }
-const commandHistory = new Map();    // requestId -> { callback, timer, doorSort, direct }
+const commandHistory = new Map();    // requestId -> { callback, timer, doorSort, direct, startTime }
 
-// doorSort+direct -> requestId 映射，加速查找
+// P0优化: 原子性指令槽位 - 每个柜门同时只允许一个指令
+// key: deviceId_doorSort_direct, value: { requestId, status, startTime }
+const commandSlots = new Map();
+
+// 保留旧索引用于向后兼容，但新增指令时优先使用commandSlots
+// doorSort_direct -> requestId 映射 (兼容旧设备响应格式)
 const commandIndex = new Map();
 
 // ---------- 心跳检测 ----------
@@ -259,9 +265,9 @@ wss.on('connection', (ws) => {
             }
 
             // ---------------- 心跳 ----------------
+            // P2优化: 心跳响应中增加pending指令状态
             if (direct === 'heart') {
                 const serverTime = getFormattedTime();
-                // deviceConnections.get(currentDeviceId).lastHeartbeat = Date.now();
                 const conn = deviceConnections.get(currentDeviceId);
                 if (conn) {
                     conn.lastHeartbeat = Date.now();
@@ -271,15 +277,29 @@ wss.on('connection', (ws) => {
                     setTimeout(() => ws.close(4403, '连接状态异常'), 1000);
                     return;
                 }
-                logger.info(`[心跳消息][deviceId=${currentDeviceId}] ${JSON.stringify(msg)}`);
-                // try {
-                //     const cloudRes = await forwardToCloudFunction({ type: 'device_heartbeat', deviceId: currentDeviceId });
-                //     ws.send(JSON.stringify({ direct: 'heart', code: cloudRes.code === 200 ? 200 : 500, data: { time: serverTime } }));
-                // } catch (err) {
-                //     logger.error(`[心跳处理失败] ${err.message}`);
-                //     ws.send(JSON.stringify({ direct: 'heart', code: 500, data: { time: serverTime }}));
-                // }
-                ws.send(JSON.stringify({ direct: 'heart', code: 200, data: { time: serverTime }}));
+
+                // 查找该设备的pending指令
+                const pendingCommands = [];
+                for (const [key, slot] of commandSlots) {
+                    if (key.startsWith(`${currentDeviceId}_`) && slot.status === 'pending') {
+                        pendingCommands.push({
+                            doorSort: slot.doorSort,
+                            direct: slot.direct,
+                            requestId: slot.requestId,
+                            elapsed: Date.now() - slot.startTime
+                        });
+                    }
+                }
+
+                logger.info(`[心跳消息][deviceId=${currentDeviceId}] pendingCount=${pendingCommands.length}, msg=${JSON.stringify(msg)}`);
+                ws.send(JSON.stringify({
+                    direct: 'heart',
+                    code: 200,
+                    data: {
+                        time: serverTime,
+                        pendingCommands  // P2: 让设备知道有哪些指令待处理
+                    }
+                }));
                 return;
             }
 
@@ -312,32 +332,91 @@ wss.on('connection', (ws) => {
             }
 
             // ---------------- openDoor/doorStatus ----------------
+            // P0优化: 增强响应匹配逻辑 - 使用commandSlots + 模糊匹配
             if (['openDoor','doorStatus'].includes(direct)) {
                 const { code } = msg;
                 const { doorSort, status } = msg.data || {};
 
-                const requestId = commandIndex.get(`${doorSort}_${direct}`);
+                // 1. 优先精确匹配 (deviceId + doorSort + direct)
+                let matchedSlot = null;
+                let matchedSlotKey = null;
+                const exactKey = `${currentDeviceId}_${doorSort}_${direct}`;
+                if (commandSlots.has(exactKey)) {
+                    matchedSlot = commandSlots.get(exactKey);
+                    matchedSlotKey = exactKey;
+                }
 
-                if (requestId && commandHistory.has(requestId)) {
-                    const entry = commandHistory.get(requestId);
-                    const elapsed = Date.now() - (entry.startTime || Date.now());
+                // 2. 如果没找到，尝试模糊匹配 (仅doorSort + direct, 兼容旧设备)
+                if (!matchedSlot) {
+                    for (const [key, slot] of commandSlots) {
+                        if (key.endsWith(`_${doorSort}_${direct}`) && slot.status === 'pending') {
+                            matchedSlot = slot;
+                            matchedSlotKey = key;
+                            logger.warn(`[模糊匹配] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, matchedSlotKey=${matchedSlotKey}`);
+                            break;
+                        }
+                    }
+                }
 
-                    logger.info(`[指令响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${requestId}`);
+                // 3. 尝试旧索引 (commandIndex) - 兼容未使用commandSlots的场景
+                if (!matchedSlot) {
+                    const oldRequestId = commandIndex.get(`${doorSort}_${direct}`);
+                    if (oldRequestId && commandHistory.has(oldRequestId)) {
+                        const entry = commandHistory.get(oldRequestId);
+                        const elapsed = Date.now() - (entry.startTime || Date.now());
 
-                    // 如果已经超时了，但设备现在才回复
-                    if (entry.timedOut) {
-                        logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
-                        commandHistory.delete(requestId);
+                        // 如果已经超时了，但设备现在才回复
+                        if (entry.timedOut) {
+                            logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
+                            commandHistory.delete(oldRequestId);
+                            commandIndex.delete(`${doorSort}_${direct}`);
+                            return;
+                        }
+
+                        logger.info(`[指令响应-旧索引] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${oldRequestId}`);
+                        const { callback } = entry;
+                        callback({ code, doorSort, status });
+                        commandHistory.delete(oldRequestId);
                         commandIndex.delete(`${doorSort}_${direct}`);
                         return;
                     }
+                }
 
-                    const { callback } = entry;
-                    callback({ code, doorSort, status });
-                    commandHistory.delete(requestId);
+                // 4. 使用commandSlots匹配结果
+                if (matchedSlot && matchedSlot.status !== 'completed') {
+                    matchedSlot.status = 'completed';
+                    const requestId = matchedSlot.requestId;
+                    const entry = commandHistory.get(requestId);
+                    const elapsed = Date.now() - (entry?.startTime || Date.now());
+
+                    if (entry) {
+                        // 如果已经超时了，但设备现在才回复
+                        if (entry.timedOut) {
+                            logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
+                            commandHistory.delete(requestId);
+                            commandIndex.delete(`${doorSort}_${direct}`);
+                            return;
+                        }
+
+                        logger.info(`[指令响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${requestId}`);
+                        const { callback } = entry;
+                        callback({ code, doorSort, status });
+                        commandHistory.delete(requestId);
+
+                        // 延迟清理slot，防止重复响应 (5秒宽限期)
+                        setTimeout(() => {
+                            const currentSlot = commandSlots.get(matchedSlotKey);
+                            if (currentSlot?.requestId === requestId) {
+                                commandSlots.delete(matchedSlotKey);
+                                logger.info(`[槽位清理] slotKey=${matchedSlotKey}, requestId=${requestId}`);
+                            }
+                        }, 5000);
+                    } else {
+                        logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, requestId=${requestId} 不存在于history`);
+                    }
                     commandIndex.delete(`${doorSort}_${direct}`);
                 } else {
-                    logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 可能原因=超时已清理或重复响应`);
+                    logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, slotExists=${!!matchedSlot}`);
                 }
                 return;
             }
@@ -366,6 +445,7 @@ wss.on('connection', (ws) => {
 });
 
 // ---------- HTTP API ----------
+// P0优化: 使用commandSlots原子性槽位机制
 app.post('/send-command', (req, res) => {
     const { deviceId, direct, data } = req.body;
     if (!deviceId || !direct || !data) {
@@ -377,20 +457,29 @@ app.post('/send-command', (req, res) => {
         return res.status(404).json({ code:500, message:`设备 ${deviceId} 不在线` });
     }
 
+    // P0优化: 使用commandSlots按deviceId_doorSort_direct索引
+    const slotKey = `${deviceId}_${data.doorSort}_${direct}`;
+    const indexKey = `${data.doorSort}_${direct}`; // 旧索引key，兼容旧设备响应
+
     // 检查是否已有同门指令在处理中
-    const indexKey = `${data.doorSort}_${direct}`;
-    if (commandIndex.has(indexKey)) {
-        const existingRequestId = commandIndex.get(indexKey);
-        if (commandHistory.has(existingRequestId)) {
-            logger.warn(`[指令重复] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, existingRequestId=${existingRequestId}`);
-            return res.status(200).json({
-                code: 202,
-                message: '同门指令处理中，请稍后重试',
-                requestId: existingRequestId
-            });
+    if (commandSlots.has(slotKey)) {
+        const slot = commandSlots.get(slotKey);
+
+        if (slot.status === 'pending' || slot.status === 'processing') {
+            // 检查是否超时
+            if (Date.now() - slot.startTime < COMMAND_TIMEOUT) {
+                // 仍在处理中，返回相同requestId (关键改进!)
+                logger.warn(`[指令重复请求] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, existingRequestId=${slot.requestId}`);
+                return res.status(200).json({
+                    code: 202,
+                    message: '同门指令处理中',
+                    requestId: slot.requestId  // 返回相同的requestId!
+                });
+            }
         }
-        logger.info(`[指令清理残留] deviceId=${deviceId}, doorSort=${data.doorSort}, 清理残留index`);
-        commandIndex.delete(indexKey);
+
+        // 超时或已完成，复用槽位但记录旧requestId
+        logger.info(`[槽位复用] deviceId=${deviceId}, doorSort=${data.doorSort}, oldRequestId=${slot.requestId}`);
     }
 
     const requestId = `cmd_${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
@@ -402,25 +491,43 @@ app.post('/send-command', (req, res) => {
         deviceWs.send(JSON.stringify(command));
         logger.info(`[指令发送] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}`);
 
+        // 创建/更新槽位
+        commandSlots.set(slotKey, {
+            requestId,
+            status: 'pending',
+            startTime: Date.now(),
+            deviceId,
+            doorSort: data.doorSort,
+            direct
+        });
+
         new Promise((resolve)=>{
             const timer = setTimeout(() => {
                 if (commandHistory.has(requestId)) {
                     const entry = commandHistory.get(requestId);
                     entry.timedOut = true;
-                    logger.warn(`[指令超时] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 等待时间=9000ms`);
+                    logger.warn(`[指令超时] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 等待时间=${COMMAND_TIMEOUT}ms`);
 
-                    // 3秒后清理
+                    // 更新槽位状态
+                    if (commandSlots.has(slotKey) && commandSlots.get(slotKey).requestId === requestId) {
+                        commandSlots.get(slotKey).status = 'timeout';
+                    }
+
+                    // 2秒后清理
                     setTimeout(() => {
                         if (commandHistory.has(requestId) && commandHistory.get(requestId).timedOut) {
                             commandHistory.delete(requestId);
-                            commandIndex.delete(`${data.doorSort}_${direct}`);
+                            commandIndex.delete(indexKey);
+                            if (commandSlots.has(slotKey) && commandSlots.get(slotKey).requestId === requestId) {
+                                commandSlots.delete(slotKey);
+                            }
                             logger.info(`[指令清理] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 原因=超时后清理`);
                         }
-                    }, 3000);
+                    }, 2000);
 
                     resolve({ code:500, message:'终端响应超时', requestId, timedOut: true });
                 }
-            }, 9000);
+            }, COMMAND_TIMEOUT);
 
             commandHistory.set(requestId, {
                 callback: (resp)=>{
@@ -434,13 +541,17 @@ app.post('/send-command', (req, res) => {
                 deviceId,
                 timedOut: false
             });
-            commandIndex.set(`${data.doorSort}_${direct}`, requestId);
+            // 保留旧索引，兼容旧设备响应
+            commandIndex.set(indexKey, requestId);
 
-            // 兜底 15秒清理
+            // 兜底清理 (稍长于超时时间)
             setTimeout(() => {
                 if (commandHistory.has(requestId)) {
                     commandHistory.delete(requestId);
-                    commandIndex.delete(`${data.doorSort}_${direct}`);
+                    commandIndex.delete(indexKey);
+                    if (commandSlots.has(slotKey) && commandSlots.get(slotKey).requestId === requestId) {
+                        commandSlots.delete(slotKey);
+                    }
                     logger.warn(`[指令兜底清理] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}`);
                 }
             }, COMMAND_CLEANUP_TIME);
@@ -452,13 +563,55 @@ app.post('/send-command', (req, res) => {
             }
             logger.info(`[指令成功] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, code=${resp.code}, elapsed=${elapsed}ms`);
             res.json(resp);
-            // === 【修改结束】 ===
         });
 
     } catch(err){
         logger.error(`[发送指令失败] ${err.message}`);
         return res.status(500).json({ code:500, message:'发送指令失败', error:err.message });
     }
+});
+
+// P1优化: 新增指令结果查询接口
+app.get('/command-result/:requestId', (req, res) => {
+    const { requestId } = req.params;
+
+    // 查找历史记录
+    if (commandHistory.has(requestId)) {
+        const entry = commandHistory.get(requestId);
+
+        // 检查是否有结果
+        if (entry.result) {
+            return res.json({
+                code: 200,
+                success: true,
+                data: entry.result
+            });
+        }
+
+        // 仍在处理中
+        if (!entry.timedOut) {
+            const elapsed = Date.now() - entry.startTime;
+            return res.json({
+                code: 202,
+                success: false,
+                message: '指令处理中',
+                elapsed
+            });
+        }
+
+        // 已超时
+        return res.json({
+            code: 408,
+            success: false,
+            message: '指令超时'
+        });
+    }
+
+    return res.status(404).json({
+        code: 404,
+        success: false,
+        message: '指令不存在或已过期'
+    });
 });
 
 app.get('/online-devices', (req,res)=>{
@@ -509,6 +662,8 @@ async function gracefulShutdown(){
     server.close(()=>logger.info('HTTP关闭'));
     deviceConnections.clear();
     commandHistory.clear();
+    commandSlots.clear();
+    commandIndex.clear();
     logger.info('资源已清理');
     process.exit(0);
 }
