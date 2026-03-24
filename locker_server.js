@@ -17,6 +17,7 @@ const HEARTBEAT_CHECK_INTERVAL = 60 * 1000; //60s
 const OFFLINE_THRESHOLD = 120 * 1000;   // 120s
 const COMMAND_TIMEOUT = 8000;            // 指令超时 8秒 (P0优化: 统一超时)
 const COMMAND_CLEANUP_TIME = 10000;       // 指令兜底清理 10秒
+const AUTO_RETRY_MAX = 1;                 // 超时自动重试次数 (V2优化)
 const MEMORY_WARNING_THRESHOLD = 500 * 1024 * 1024; // 500MB
 const CLOUD_RETRY_MAX = 3;       // 云函数调用最大重试次数
 const CLOUD_RETRY_INTERVAL = 1000; // 每次重试的间隔基准 (ms)，会指数退避
@@ -349,10 +350,10 @@ wss.on('connection', (ws) => {
                 // 2. 如果没找到，尝试模糊匹配 (仅doorSort + direct, 兼容旧设备)
                 if (!matchedSlot) {
                     for (const [key, slot] of commandSlots) {
-                        if (key.endsWith(`_${doorSort}_${direct}`) && slot.status === 'pending') {
+                        if (key.endsWith(`_${doorSort}_${direct}`) && slot.status !== 'completed') {
                             matchedSlot = slot;
                             matchedSlotKey = key;
-                            logger.warn(`[模糊匹配] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, matchedSlotKey=${matchedSlotKey}`);
+                            logger.warn(`[模糊匹配] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, matchedSlotKey=${matchedSlotKey}, slotStatus=${slot.status}`);
                             break;
                         }
                     }
@@ -383,41 +384,44 @@ wss.on('connection', (ws) => {
                 }
 
                 // 4. 使用commandSlots匹配结果
-                if (matchedSlot && matchedSlot.status !== 'completed') {
-                    matchedSlot.status = 'completed';
+                if (matchedSlot) {
+                    // V2优化: 场景1：slot已标记completed → 重复响应，INFO
+                    if (matchedSlot.status === 'completed') {
+                        logger.info(`[重复响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, requestId=${matchedSlot.requestId}`);
+                        return;
+                    }
+
                     const requestId = matchedSlot.requestId;
                     const entry = commandHistory.get(requestId);
+
+                    // V2优化: 场景2：slot存在但entry已清理 → 延迟响应，INFO
+                    if (!entry) {
+                        logger.info(`[延迟响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, requestId=${requestId}, entry已清理`);
+                        commandIndex.delete(`${doorSort}_${direct}`);
+                        return;
+                    }
+
+                    matchedSlot.status = 'completed';
                     const elapsed = Date.now() - (entry?.startTime || Date.now());
 
-                    if (entry) {
-                        // 如果已经超时了，但设备现在才回复
-                        if (entry.timedOut) {
-                            logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
-                            commandHistory.delete(requestId);
-                            commandIndex.delete(`${doorSort}_${direct}`);
-                            return;
-                        }
-
-                        logger.info(`[指令响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${requestId}`);
-                        const { callback } = entry;
-                        callback({ code, doorSort, status });
+                    // 如果已经超时了，但设备现在才回复
+                    if (entry.timedOut) {
+                        logger.warn(`[延迟回复] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, 延迟=${elapsed}ms, 请求已超时`);
                         commandHistory.delete(requestId);
-
-                        // 延迟清理slot，防止重复响应 (5秒宽限期)
-                        setTimeout(() => {
-                            const currentSlot = commandSlots.get(matchedSlotKey);
-                            if (currentSlot?.requestId === requestId) {
-                                commandSlots.delete(matchedSlotKey);
-                                logger.info(`[槽位清理] slotKey=${matchedSlotKey}, requestId=${requestId}`);
-                            }
-                        }, 5000);
-                    } else {
-                        logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, requestId=${requestId} 不存在于history`);
+                        commandIndex.delete(`${doorSort}_${direct}`);
+                        return;
                     }
+
+                    logger.info(`[指令响应] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, elapsed=${elapsed}ms, requestId=${requestId}`);
+                    const { callback } = entry;
+                    callback({ code, doorSort, status });
+                    commandHistory.delete(requestId);
                     commandIndex.delete(`${doorSort}_${direct}`);
-                } else {
-                    logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, slotExists=${!!matchedSlot}`);
+                    return;
                 }
+
+                // V2优化: 场景3：没有任何匹配 → 真正未匹配，WARN
+                logger.warn(`[未匹配指令] deviceId=${currentDeviceId}, doorSort=${doorSort}, direct=${direct}, code=${code}, slotExists=${!!matchedSlot}`);
                 return;
             }
 
@@ -506,14 +510,34 @@ app.post('/send-command', (req, res) => {
                 if (commandHistory.has(requestId)) {
                     const entry = commandHistory.get(requestId);
                     entry.timedOut = true;
-                    logger.warn(`[指令超时] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 等待时间=${COMMAND_TIMEOUT}ms`);
+
+                    // V2优化: 检查是否可自动重试
+                    if (!entry.retryCount) entry.retryCount = 0;
+                    if (entry.retryCount < AUTO_RETRY_MAX) {
+                        entry.retryCount++;
+                        logger.info(`[自动重试] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, 重试第${entry.retryCount}次/${AUTO_RETRY_MAX}`);
+
+                        // 重新发送指令
+                        deviceWs.send(JSON.stringify(command));
+                        entry.startTime = Date.now();
+                        entry.timedOut = false;
+
+                        // 更新槽位状态
+                        if (commandSlots.has(slotKey) && commandSlots.get(slotKey).requestId === requestId) {
+                            commandSlots.get(slotKey).startTime = Date.now();
+                        }
+                        return; // 不resolve，等待新响应
+                    }
+
+                    // 达到重试上限，返回超时
+                    logger.warn(`[指令超时] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 等待时间=${COMMAND_TIMEOUT}ms, 重试次数=${entry.retryCount}`);
 
                     // 更新槽位状态
                     if (commandSlots.has(slotKey) && commandSlots.get(slotKey).requestId === requestId) {
                         commandSlots.get(slotKey).status = 'timeout';
                     }
 
-                    // 2秒后清理
+                    // V2优化: 5秒后清理 (延长窗口，处理设备延迟响应)
                     setTimeout(() => {
                         if (commandHistory.has(requestId) && commandHistory.get(requestId).timedOut) {
                             commandHistory.delete(requestId);
@@ -523,7 +547,7 @@ app.post('/send-command', (req, res) => {
                             }
                             logger.info(`[指令清理] deviceId=${deviceId}, doorSort=${data.doorSort}, direct=${direct}, requestId=${requestId}, 原因=超时后清理`);
                         }
-                    }, 2000);
+                    }, 5000);
 
                     resolve({ code:500, message:'终端响应超时', requestId, timedOut: true });
                 }
