@@ -679,15 +679,34 @@ async function gracefulShutdown(){
     //等待最多 3 秒，超时后继续退出
     await Promise.race([
         Promise.allSettled(offlinePromises),
-        new Promise(resolve => setTimeout(resolve, 3000)) // 超时保护
+        new Promise(resolve => setTimeout(resolve, 3000))
     ]);
 
-    wss.close(()=>logger.info('WebSocket关闭'));
-    server.close(()=>logger.info('HTTP关闭'));
-    deviceConnections.clear();
-    commandHistory.clear();
-    commandSlots.clear();
-    commandIndex.clear();
-    logger.info('资源已清理');
+    // 强制断开所有设备 WebSocket 连接（修复端口占用的关键）
+    for (const [deviceId, { ws }] of deviceConnections.entries()) {
+        try {
+            ws.terminate();
+            logger.info(`[关闭连接] 设备 ${deviceId} WebSocket 已断开`);
+        } catch (e) {
+            logger.warn(`[关闭连接] 设备 ${deviceId} 断开失败: ${e.message}`);
+        }
+    }
+
+    // 等待 wss 和 server 完全关闭后再退出
+    await new Promise(resolve => {
+        wss.close(() => {
+            logger.info('[WebSocket] 已停止接受新连接');
+            server.close(() => {
+                logger.info('[HTTP] 服务器已关闭');
+                deviceConnections.clear();
+                commandHistory.clear();
+                commandSlots.clear();
+                commandIndex.clear();
+                logger.info('资源已清理');
+                resolve();
+            });
+        });
+    });
+
     process.exit(0);
 }
