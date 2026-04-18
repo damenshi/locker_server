@@ -279,6 +279,7 @@ app.post('/setDeviceAppid', async (req, res) => {
                 deviceData: {
                     deviceId,
                     internalNo: deviceData.internalNo,
+                    appid: appid,  // 传递目标小程序 appid
                     cabinetCount: deviceData.cabinetCount || 0,
                     doorCount: deviceData.doorCount || 0,
                     deviceAddress: deviceData.deviceAddress || null,
