@@ -12,7 +12,68 @@ const DailyRotateFile = require('winston-daily-rotate-file');
 // ---------- 配置 ----------
 axios.defaults.timeout = 8000;
 const PORT = process.env.PORT || 3000;
-const CLOUD_FUNCTION_URL = 'https://cloudbase-3gnr17whd71a5b45-1379469522.ap-shanghai.app.tcloudbase.com/server';
+
+// 小程序A配置
+const APPID_A = 'wxc447a8e66f5f8294';
+const CLOUD_URL_A = 'https://cloudbase-3gnr17whd71a5b45-1379469522.ap-shanghai.app.tcloudbase.com/server';
+
+// 小程序B配置
+const APPID_B = 'wx2697ba99fe54bd9d';
+const CLOUD_URL_B = 'https://cloudbase-d1g6vw253b659ade2-1423387695.ap-shanghai.app.tcloudbase.com/server';
+
+// 默认使用小程序A的云函数
+let CLOUD_FUNCTION_URL = CLOUD_URL_A;
+
+// 设备归属映射：deviceId -> 云函数URL (旧版兼容)
+const deviceCloudMap = {};
+
+// 设备归属映射：deviceId -> appid (新版)
+const deviceAppidMap = {};
+
+// 全局设备编号计数器（持久化到文件）
+const COUNTER_FILE = path.join(__dirname, 'device_counter.json');
+let deviceCounter = { nextSeq: 1 };
+
+// 加载计数器
+function loadCounter() {
+    try {
+        return JSON.parse(fs.readFileSync(COUNTER_FILE));
+    } catch {
+        return { nextSeq: 1 };
+    }
+}
+
+// 保存计数器
+function saveCounter() {
+    fs.writeFileSync(COUNTER_FILE, JSON.stringify(deviceCounter, null, 2));
+}
+
+// 从云函数获取当前最大编号（向后兼容）
+async function getMaxInternalNoFromCloud(cloudUrl) {
+    try {
+        const res = await axios.post(cloudUrl, { type: 'get_max_internal_no' }, { timeout: 5000 });
+        if (res.data?.code === 200 && res.data?.data?.maxSeq) {
+            return parseInt(res.data.data.maxSeq);
+        }
+    } catch (err) {
+        logger.warn(`[计数器同步] 从 ${cloudUrl} 获取失败: ${err.message}`);
+    }
+    return 0;
+}
+
+// 启动时初始化计数器
+async function initCounterFromCloud() {
+    logger.info('[计数器初始化] 开始从云函数同步...');
+    const maxA = await getMaxInternalNoFromCloud(CLOUD_URL_A);
+    const maxB = await getMaxInternalNoFromCloud(CLOUD_URL_B);
+    const maxSeq = Math.max(maxA, maxB, deviceCounter.nextSeq - 1);
+    if (maxSeq > 0) {
+        deviceCounter.nextSeq = maxSeq + 1;
+        saveCounter();
+        logger.info(`[计数器初始化] 同步完成，当前序号: ${deviceCounter.nextSeq}`);
+    }
+}
+
 const HEARTBEAT_CHECK_INTERVAL = 60 * 1000; //60s
 const OFFLINE_THRESHOLD = 120 * 1000;   // 120s
 const COMMAND_TIMEOUT = 8000;            // 指令超时 8秒 (P0优化: 统一超时)
@@ -107,7 +168,8 @@ function getFormattedTime() {
 //     }
 // }
 // ---------- 新的云函数转发（带重试机制，可配置） ----------
-async function forwardToCloudFunction(payload) {
+async function forwardToCloudFunction(payload, cloudUrl) {
+    const targetUrl = cloudUrl || CLOUD_FUNCTION_URL;
     const { deviceId, type } = payload || {};
     let lastErr = null;
     const startTime = Date.now();
@@ -115,8 +177,8 @@ async function forwardToCloudFunction(payload) {
     for (let attempt = 1; attempt <= CLOUD_RETRY_MAX; attempt++) {
         const attemptStart = Date.now();
         try {
-            logger.info(`[云函数转发] deviceId=${deviceId}, type=${type}, 第${attempt}次尝试, 超时=${axios.defaults.timeout}ms`);
-            const res = await axios.post(CLOUD_FUNCTION_URL, payload, { timeout: axios.defaults.timeout });
+            logger.info(`[云函数转发] deviceId=${deviceId}, type=${type}, url=${targetUrl}, 第${attempt}次尝试, 超时=${axios.defaults.timeout}ms`);
+            const res = await axios.post(targetUrl, payload, { timeout: axios.defaults.timeout });
             const elapsed = Date.now() - startTime;
             logger.info(`[云函数成功] deviceId=${deviceId}, type=${type}, 尝试次数=${attempt}, 总耗时=${elapsed}ms`);
             return res.data;
@@ -151,6 +213,113 @@ async function forwardToCloudFunction(payload) {
 const app = express();
 app.use(bodyParser.json());
 const server = http.createServer(app);
+
+// ---------- 设备归属管理 API (旧版兼容) ----------
+// 设置设备归属到指定云函数
+app.post('/setDeviceCloud', (req, res) => {
+    const { deviceId, cloudUrl } = req.body;
+    if (!deviceId || !cloudUrl) {
+        logger.warn(`[设备归属设置] 参数错误 deviceId=${deviceId}, cloudUrl=${cloudUrl}`);
+        return res.status(400).json({ code: 500, message: '缺少参数 deviceId 或 cloudUrl' });
+    }
+    deviceCloudMap[deviceId] = cloudUrl;
+    logger.info(`[设备归属设置] deviceId=${deviceId} -> ${cloudUrl}`);
+    res.json({ code: 200, message: '设置成功' });
+});
+
+// 获取设备归属
+app.get('/getDeviceCloud', (req, res) => {
+    const { deviceId } = req.query;
+    if (!deviceId) {
+        return res.status(400).json({ code: 500, message: '缺少参数 deviceId' });
+    }
+    const cloudUrl = deviceCloudMap[deviceId] || CLOUD_URL_A;
+    logger.info(`[设备归属查询] deviceId=${deviceId} -> ${cloudUrl}`);
+    res.json({ code: 200, data: { deviceId, cloudUrl } });
+});
+
+// 获取所有设备归属列表
+app.get('/listDeviceCloud', (req, res) => {
+    const list = Object.entries(deviceCloudMap).map(([deviceId, cloudUrl]) => ({ deviceId, cloudUrl }));
+    logger.info(`[设备归属列表] 共${list.length}个设备`);
+    res.json({ code: 200, data: list });
+});
+
+// ---------- 设备归属管理 API (新版 - 基于 appid) ----------
+// 生成全局唯一设备编号
+app.get('/generateInternalNo', (req, res) => {
+    const seq = deviceCounter.nextSeq++;
+    saveCounter();
+    const internalNo = 'L' + String(seq).padStart(4, '0');
+    logger.info(`[编号生成] seq=${seq}, internalNo=${internalNo}`);
+    res.json({ code: 200, data: { internalNo, seq } });
+});
+
+// 设置设备归属（切换小程序）
+app.post('/setDeviceAppid', async (req, res) => {
+    const { deviceId, appid, deviceData } = req.body;
+
+    if (!deviceId || !appid) {
+        logger.warn(`[设备归属设置] 参数错误 deviceId=${deviceId}, appid=${appid}`);
+        return res.status(400).json({ code: 500, message: '缺少参数 deviceId 或 appid' });
+    }
+
+    // 验证 appid 有效性
+    if (appid !== APPID_A && appid !== APPID_B) {
+        return res.status(400).json({ code: 500, message: '无效的 appid' });
+    }
+
+    try {
+        // 1. 在目标数据库预创建设备记录（保持原编号）
+        const targetUrl = appid === APPID_A ? CLOUD_URL_A : CLOUD_URL_B;
+        if (deviceData) {
+            logger.info(`[设备归属设置] 预创建设备记录 deviceId=${deviceId}, target=${targetUrl}`);
+            await forwardToCloudFunction({
+                type: 'pre_create_device',
+                deviceData: {
+                    deviceId,
+                    internalNo: deviceData.internalNo,
+                    cabinetCount: deviceData.cabinetCount || 0,
+                    doorCount: deviceData.doorCount || 0,
+                    deviceAddress: deviceData.deviceAddress || null,
+                    screenNo: deviceData.screenNo || 0
+                }
+            }, targetUrl);
+        }
+
+        // 2. 更新映射
+        deviceAppidMap[deviceId] = appid;
+        logger.info(`[设备归属设置] deviceId=${deviceId} -> appid=${appid}`);
+
+        // 3. 强制设备重连（如果有连接）
+        const conn = deviceConnections.get(deviceId);
+        if (conn?.ws) {
+            conn.ws.close();
+            deviceConnections.delete(deviceId);
+            logger.info(`[设备归属设置] 强制设备 ${deviceId} 重连`);
+        }
+
+        res.json({ code: 200, message: '设置成功，设备将重连到新环境' });
+    } catch (err) {
+        logger.error(`[设备归属设置] 失败: ${err.message}`);
+        res.status(500).json({ code: 500, message: '设置失败: ' + err.message });
+    }
+});
+
+// 获取设备归属
+app.get('/getDeviceAppid', (req, res) => {
+    const { deviceId } = req.query;
+    if (!deviceId) {
+        return res.status(400).json({ code: 500, message: '缺少参数 deviceId' });
+    }
+    const appid = deviceAppidMap[deviceId] || APPID_A;
+    res.json({ code: 200, data: { deviceId, appid } });
+});
+
+// 获取所有设备归属映射
+app.get('/listDeviceAppid', (req, res) => {
+    res.json({ code: 200, data: deviceAppidMap });
+});
 
 // ---------- WebSocket ----------
 const wss = new WebSocket.Server({ server });
@@ -242,13 +411,52 @@ wss.on('connection', (ws) => {
                     return;
                 }
                 try {
-                    const cloudRes = await forwardToCloudFunction({ type: 'device_login_request', deviceId });
+                    // 根据设备归属决定使用哪个云函数（优先使用 deviceAppidMap，兼容 deviceCloudMap）
+                    let targetAppid = deviceAppidMap[deviceId];
+                    let targetCloudUrl;
+
+                    if (targetAppid) {
+                        targetCloudUrl = targetAppid === APPID_A ? CLOUD_URL_A : CLOUD_URL_B;
+                    } else if (deviceCloudMap[deviceId]) {
+                        // 兼容旧版映射
+                        targetCloudUrl = deviceCloudMap[deviceId];
+                        targetAppid = targetCloudUrl === CLOUD_URL_A ? APPID_A : APPID_B;
+                    } else {
+                        // 默认使用A
+                        targetCloudUrl = CLOUD_URL_A;
+                        targetAppid = APPID_A;
+                    }
+
+                    logger.info(`[设备登录] deviceId=${deviceId}, appid=${targetAppid}, 使用云函数=${targetCloudUrl}`);
+
+                    // 转发登录请求到对应云函数
+                    const cloudRes = await forwardToCloudFunction({
+                        type: 'device_login_request',
+                        deviceId,
+                        targetAppid  // 告知云函数期望的appid
+                    }, targetCloudUrl);
+
                     if (cloudRes.code === 200 && cloudRes.data?.number && cloudRes.data?.url) {
                         currentDeviceId = deviceId;
-                        deviceConnections.set(deviceId, { ws, lastHeartbeat: Date.now() });
-                        ws.send(JSON.stringify({ direct: 'login', code: 200, data: { number: cloudRes.data.number, url: cloudRes.data.url } }));
-                        logger.info(`[设备上线] deviceId=${deviceId}, 当前在线设备数=${deviceConnections.size}`);
-                    } else throw new Error(cloudRes.message || '云函数未返回有效编号或URL');
+                        deviceConnections.set(deviceId, {
+                            ws,
+                            lastHeartbeat: Date.now(),
+                            appid: targetAppid,
+                            cloudUrl: targetCloudUrl
+                        });
+                        ws.send(JSON.stringify({
+                            direct: 'login',
+                            code: 200,
+                            data: {
+                                number: cloudRes.data.number,
+                                url: cloudRes.data.url,
+                                appid: targetAppid
+                            }
+                        }));
+                        logger.info(`[设备上线] deviceId=${deviceId}, appid=${targetAppid}, 当前在线设备数=${deviceConnections.size}`);
+                    } else {
+                        throw new Error(cloudRes.message || '云函数未返回有效编号或URL');
+                    }
                 } catch (err) {
                     logger.error(`[服务器消息]设备 ${deviceId} 登录失败: ${err.message}`);
                     ws.send(JSON.stringify({ direct: 'login', code: 500, data: { deviceId }}));
@@ -644,15 +852,23 @@ app.get('/online-devices', (req,res)=>{
 });
 
 // ---------- 启动 ----------
-function startServer() {
-    server.listen(PORT, ()=>logger.info(`服务器已启动，端口 ${PORT}`));
-    server.on('error', err=>{
-        if(err.code==='EADDRINUSE'){ 
+async function startServer() {
+    // 先加载计数器
+    deviceCounter = loadCounter();
+    logger.info(`[计数器] 从文件加载: nextSeq=${deviceCounter.nextSeq}`);
+
+    // 从云函数同步最大编号（向后兼容）
+    await initCounterFromCloud();
+
+    server.listen(PORT, () => logger.info(`服务器已启动，端口 ${PORT}`));
+    server.on('error', err => {
+        if (err.code === 'EADDRINUSE') {
             logger.warn(`端口 ${PORT} 已占用, 1秒后重试`);
-            setTimeout(startServer,1000);
-        }else logger.error(`服务器启动错误: ${err.message}`);
+            setTimeout(startServer, 1000);
+        } else logger.error(`服务器启动错误: ${err.message}`);
     });
 }
+
 startServer();
 startHeartbeatChecker();
 startMemoryMonitor();
