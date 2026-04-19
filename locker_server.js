@@ -28,7 +28,30 @@ let CLOUD_FUNCTION_URL = CLOUD_URL_A;
 const deviceCloudMap = {};
 
 // 设备归属映射：deviceId -> appid (新版)
-const deviceAppidMap = {};
+const APPID_MAP_FILE = path.join(__dirname, 'device_appid_map.json');
+let deviceAppidMap = {};
+
+// 加载设备归属映射
+function loadDeviceAppidMap() {
+    try {
+        const data = JSON.parse(fs.readFileSync(APPID_MAP_FILE, 'utf8'));
+        logger.info(`[映射加载] 成功加载 ${Object.keys(data).length} 个设备映射`);
+        return data;
+    } catch (err) {
+        logger.info('[映射加载] 文件不存在或读取失败，使用空映射');
+        return {};
+    }
+}
+
+// 保存设备归属映射
+function saveDeviceAppidMap() {
+    try {
+        fs.writeFileSync(APPID_MAP_FILE, JSON.stringify(deviceAppidMap, null, 2));
+        logger.info(`[映射保存] 已保存 ${Object.keys(deviceAppidMap).length} 个设备映射`);
+    } catch (err) {
+        logger.error(`[映射保存] 失败: ${err.message}`);
+    }
+}
 
 // 全局设备编号计数器（持久化到文件）
 const COUNTER_FILE = path.join(__dirname, 'device_counter.json');
@@ -288,8 +311,9 @@ app.post('/setDeviceAppid', async (req, res) => {
             }, targetUrl);
         }
 
-        // 2. 更新映射
+        // 2. 更新映射并保存
         deviceAppidMap[deviceId] = appid;
+        saveDeviceAppidMap();
         logger.info(`[设备归属设置] deviceId=${deviceId} -> appid=${appid}`);
 
         // 3. 强制设备重连（如果有连接）
@@ -863,6 +887,9 @@ async function startServer() {
     // 先加载计数器
     deviceCounter = loadCounter();
     logger.info(`[计数器] 从文件加载: nextSeq=${deviceCounter.nextSeq}`);
+
+    // 加载设备归属映射
+    deviceAppidMap = loadDeviceAppidMap();
 
     // 从云函数同步最大编号（向后兼容）
     await initCounterFromCloud();
