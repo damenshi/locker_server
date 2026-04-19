@@ -386,8 +386,10 @@ function startHeartbeatChecker() {
                 const lastTime = new Date(lastHeartbeat).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai' });
                 logger.warn(`[心跳超时] deviceId=${deviceId}, 上次心跳=${lastTime}, 离线阈值=${OFFLINE_THRESHOLD}ms, 当前在线设备数=${deviceConnections.size}`);
 
-                // 记录离线事件
-                forwardToCloudFunction({ type: 'device_offline', deviceId, timestamp: now })
+                // 记录离线事件（使用设备对应的云函数URL）
+                const conn = deviceConnections.get(deviceId);
+                const deviceCloudUrl = conn?.cloudUrl || CLOUD_FUNCTION_URL;
+                forwardToCloudFunction({ type: 'device_offline', deviceId, timestamp: now }, deviceCloudUrl)
                     .catch(err => logger.error(`[离线通知失败] deviceId=${deviceId}, error=${err.message}`));
 
                 // 尝试关闭 socket (如果还没关)
@@ -677,8 +679,11 @@ wss.on('connection', (ws) => {
         if (currentDeviceId) {
             const reasonStr = reason ? reason.toString() : '未知';
             logger.info(`[设备下线] deviceId=${currentDeviceId}, 原因=${reasonStr}, 当前在线设备数=${deviceConnections.size}`);
+            // 获取设备对应的云函数URL（在删除前获取）
+            const conn = deviceConnections.get(currentDeviceId);
+            const deviceCloudUrl = conn?.cloudUrl || CLOUD_FUNCTION_URL;
             deviceConnections.delete(currentDeviceId);
-            forwardToCloudFunction({ type: 'device_offline', deviceId: currentDeviceId }).catch(err => logger.error(err.message));
+            forwardToCloudFunction({ type: 'device_offline', deviceId: currentDeviceId }, deviceCloudUrl).catch(err => logger.error(err.message));
         } else {
             logger.info(`[连接断开] 未登录设备断开, 当前在线设备数=${deviceConnections.size}`);
         }
@@ -918,9 +923,10 @@ async function gracefulShutdown(){
 
     //主动通知所有设备下线
     const offlinePromises = [];
-    for (const [deviceId] of deviceConnections.entries()) {
+    for (const [deviceId, conn] of deviceConnections.entries()) {
+        const deviceCloudUrl = conn?.cloudUrl || CLOUD_FUNCTION_URL;
         offlinePromises.push(
-        forwardToCloudFunction({ type: 'device_offline', deviceId })
+        forwardToCloudFunction({ type: 'device_offline', deviceId }, deviceCloudUrl)
             .then(() => logger.info(`[关闭服务器] 通知设备 ${deviceId} 下线`))
             .catch(err => logger.error(`[关闭服务器] 通知设备 ${deviceId} 下线失败: ${err.message}`))
         );
