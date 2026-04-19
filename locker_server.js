@@ -518,7 +518,10 @@ wss.on('connection', (ws) => {
                 const { phone, password, time } = msg.data || {};
                 logger.info(`[openByPhone][deviceId=${currentDeviceId}] ${JSON.stringify(msg)}`);
                 try {
-                    const cloudRes = await forwardToCloudFunction({ type: 'open_by_phone_request', deviceId: currentDeviceId, data: { phone, password, time } });
+                    // 获取设备对应的云函数 URL（支持多小程序切换）
+                    const conn = deviceConnections.get(currentDeviceId);
+                    const deviceCloudUrl = conn?.cloudUrl || CLOUD_FUNCTION_URL;
+                    const cloudRes = await forwardToCloudFunction({ type: 'open_by_phone_request', deviceId: currentDeviceId, data: { phone, password, time } }, deviceCloudUrl);
                     const serverTime = getFormattedTime();
                     ws.send(JSON.stringify({ direct: 'openByPhone', code: cloudRes.code === 200 ? 200 : 500, data: { time: serverTime, doorSort: cloudRes.data?.doorSort }}));
                 } catch (err) {
@@ -532,7 +535,10 @@ wss.on('connection', (ws) => {
                 const { phone, password, time } = msg.data || {};
                 logger.info(`[midOpen][deviceId=${currentDeviceId}] ${JSON.stringify(msg)}`);
                 try {
-                    const cloudRes = await forwardToCloudFunction({ type: 'mid_way_open_door', deviceId: currentDeviceId, data: { phone, password, time } });
+                    // 获取设备对应的云函数 URL（支持多小程序切换）
+                    const conn = deviceConnections.get(currentDeviceId);
+                    const deviceCloudUrl = conn?.cloudUrl || CLOUD_FUNCTION_URL;
+                    const cloudRes = await forwardToCloudFunction({ type: 'mid_way_open_door', deviceId: currentDeviceId, data: { phone, password, time } }, deviceCloudUrl);
                     const serverTime = getFormattedTime();
                     ws.send(JSON.stringify({ direct: 'midOpen', code: cloudRes.code === 200 ? 200 : 500, data: { time: serverTime, doorSort: cloudRes.data?.doorSort }}));
                 } catch (err) {
